@@ -8,20 +8,55 @@ COPY go.sum .
 RUN go mod download
 COPY . .
 
+# Build statically linked binary
 ENV CGO_ENABLED=0
 RUN make build-controller GOARCH=$TARGETARCH
 
-FROM --platform=$TARGETPLATFORM registry.access.redhat.com/ubi9-minimal
+# The approach here is to copy all libraries that ldd reports
+    # Sample ldd output on x86_64
+    #  linux-vdso.so.1 (0x00007fff123456789) - provided in all linux arches, no need to copy  
+    #  libresolv.so.2 => /lib/x86_64-linux-gnu/libresolv.so.2 (0x00007f1234567890)
+    #  libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f1234567890)
+    #  /lib64/ld-linux-x86-64.so.2 (0x00007f1234567890)
+RUN mkdir -p /runtime-deps && \
+    ldd /go/src/app/controller | while IFS= read -r line; do \
+        # The vdso library (example linux-vdso.so.1), is supplied by linux, skip it
+        echo "$line" | grep -q "linux-vdso" && continue; \
+        # Extract library path - note that some lines have => and some
+        # lines have the direct full path, we need to handle both formats.
+        lib_path=""; \
+        if echo "$line" | grep -q '=>'; then \
+            # Format: "libname.so => /path/to/lib (address)"
+            lib_path=$(echo "$line" | awk '{print $3}'); \
+        elif echo "$line" | grep -qE '^[[:space:]]*/'; then \
+            # Format: "/path/to/ld-linux (address)" - dynamic linker
+            lib_path=$(echo "$line" | awk '{print $1}'); \
+        fi; \
+        # Copy the file into the runtime-deps only if path is valid
+        if [ -f "$lib_path" ] && [ "$lib_path" != "" ]; then \
+            dest_dir="/runtime-deps$(dirname "$lib_path")"; \
+            mkdir -p "$dest_dir"; \
+            cp "$lib_path" "$dest_dir/"; \
+            echo "Copied: $lib_path"; \
+        fi; \
+    done
+
+# Use scratch for minimal image size
+FROM scratch
+
 LABEL \
   org.opencontainers.image.title="Skupper Controller" \
   org.opencontainers.image.description="Kubernetes controller for operating skupper networks"
 
-# Create user and group and switch to user's context
-RUN microdnf -y install shadow-utils \
-&& microdnf clean all
-RUN useradd --uid 10000 runner
-USER 10000
+# Copy the collected files from the /runtime-deps folder from the builder
+COPY --from=builder /runtime-deps /
 
 WORKDIR /app
+
+# Copy the statically linked binary
 COPY --from=builder /go/src/app/controller .
+
+# Use numeric user ID (no need to create user in scratch)
+USER 10000
+
 CMD ["/app/controller"]
